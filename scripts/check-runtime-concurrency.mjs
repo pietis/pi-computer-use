@@ -1,10 +1,121 @@
 import assert from "node:assert/strict";
 import { canRetryInForeground, outcomeAfterCheck, outcomeAfterObservedValues, prepareAction } from "../src/actions.ts";
+import { observationPolicy } from "../src/config.ts";
 import { nodeByRef, parseLookResponse } from "../src/outline.ts";
+import { parseRecoveryDecision, requestLightweightRecovery } from "../src/recovery.ts";
 import { ResourceScheduler, StateStore, StaleResourceStateError } from "../src/runtime.ts";
 import { changesBetween, stabilizeRefs } from "../src/view.ts";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+assert.deepEqual(
+	observationPolicy("semantic"),
+	{ imageMode: "never", readText: "never", includeImage: false },
+	"semantic observation must disable image capture and OCR",
+);
+assert.deepEqual(
+	observationPolicy("fused"),
+	{ imageMode: "auto", readText: "auto", includeImage: true },
+	"fused observation must preserve the default capture behavior",
+);
+assert.deepEqual(
+	observationPolicy("visual"),
+	{ imageMode: "always", readText: "always", includeImage: true },
+	"visual observation must force image capture and OCR",
+);
+
+const recoveryRefs = new Set(["@e1", "@e2"]);
+const validRecovery = parseRecoveryDecision(
+	JSON.stringify({
+		decision: "execute",
+		confidence: 0.94,
+		reason: "A replacement confirmation button is present.",
+		actions: [{ action: "press", ref: "@e2" }],
+		expect: { text: "Complete", until: "present", timeoutMs: 2_000 },
+	}),
+	{ validRefs: recoveryRefs, allowedText: new Set(), minConfidence: 0.85 },
+);
+assert.equal(validRecovery?.decision, "execute", "safe high-confidence recovery was not accepted");
+assert.deepEqual(validRecovery?.decision === "execute" ? validRecovery.actions : undefined, [{ action: "press", ref: "@e2" }], "accepted recovery changed its semantic action");
+
+const lowConfidenceRecovery = parseRecoveryDecision(
+	JSON.stringify({
+		decision: "execute",
+		confidence: 0.5,
+		reason: "The target is ambiguous.",
+		actions: [{ action: "click", ref: "@e2" }],
+		expect: { text: "Complete" },
+	}),
+	{ validRefs: recoveryRefs, allowedText: new Set(), minConfidence: 0.85 },
+);
+assert.equal(lowConfidenceRecovery?.decision, "escalate", "low-confidence recovery was not escalated");
+
+assert.equal(
+	parseRecoveryDecision(
+		JSON.stringify({
+			decision: "execute",
+			confidence: 0.99,
+			reason: "Invented text should be rejected.",
+			actions: [{ action: "setText", ref: "@e1", text: "new secret" }],
+			expect: { ref: "@e1", value: "new secret" },
+		}),
+		{ validRefs: recoveryRefs, allowedText: new Set(["original text"]), minConfidence: 0.85 },
+	),
+	undefined,
+	"recovery accepted text that was not present in the failed transaction",
+);
+assert.equal(
+	parseRecoveryDecision(
+		JSON.stringify({
+			decision: "execute",
+			confidence: 0.99,
+			reason: "Coordinate actions should be rejected.",
+			actions: [{ action: "click", x: 10, y: 20 }],
+			expect: { text: "Complete" },
+		}),
+		{ validRefs: recoveryRefs, allowedText: new Set(), minConfidence: 0.85 },
+	),
+	undefined,
+	"recovery accepted an ungrounded coordinate action",
+);
+
+let lightweightOptions;
+const lightweightResult = await requestLightweightRecovery(
+	{
+		model: { provider: "mock", id: "fast", api: "mock", name: "Mock Fast Model" },
+		modelRegistry: {
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
+		},
+	},
+	{
+		app: "TextEdit",
+		windowTitle: "Untitled",
+		stateId: "state-2",
+		outcome: "didnt",
+		failedActions: [{ action: "press", ref: "@e1" }],
+		outline: "@e1 button Retry\n@e2 staticText Complete",
+		validRefs: recoveryRefs,
+	},
+	undefined,
+	async (_model, _context, options) => {
+		lightweightOptions = options;
+		return {
+			content: [{
+				type: "text",
+				text: JSON.stringify({
+					decision: "execute",
+					confidence: 0.95,
+					reason: "Retry is present and guarded by a completion marker.",
+					actions: [{ action: "press", ref: "@e1" }],
+					expect: { text: "Complete" },
+				}),
+			}],
+			stopReason: "stop",
+		};
+	},
+);
+assert.equal(lightweightOptions?.reasoning, undefined, "lightweight exception handler enabled reasoning");
+assert.equal(lightweightResult.decision?.decision, "execute", "lightweight exception handler did not accept a safe mocked response");
 
 const states = new StateStore(2);
 const first = states.create("pid:1", 0, { label: "first" });

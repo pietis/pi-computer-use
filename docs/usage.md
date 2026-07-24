@@ -98,6 +98,61 @@ act_ui({
 })
 ```
 
+## Plan-once execution
+
+For predictable desktop workflows, `/computer-use-run` performs one semantic
+AX observation, calls the selected model once to produce a bounded JSON plan,
+then executes every phase natively. Successful execution ends without a
+follow-up model call. A new root is observed between phases only when the plan
+marks `refreshRootAfter`.
+
+```text
+/computer-use-run -- Create a new TextEdit document and enter "hello"
+```
+
+The command prints a JSON latency report in `--print` and `--mode json` runs.
+It separates setup, app launch, root acquisition, initial observation, model
+TTFT/planning, selector resolution, native delivery, verification, successor
+observation, and root refresh time. On macOS, the runner resolves an installed
+application named in the task, including its localized display name and bundle
+identifier. `--app` and `--bundle-id` remain available as explicit overrides
+when the task names multiple applications.
+
+The repository wrapper accepts the same task directly and resolves the named
+installed app automatically:
+
+```sh
+npm run cua -- -- 'TextEdit에서 새 문서를 만들고 "hello"를 입력하세요.'
+npm run cua -- -- '메모에서 "회의 메모"라는 새 메모를 만드세요.'
+```
+
+The plan-once path currently controls one target app per invocation. Its
+semantic action set is app-neutral: press, click, exact setText, focused
+typeText, keypress, and scoped scroll.
+
+## Checked GPT execution
+
+`cua:hybrid` asks the selected GPT model for exactly one action against the
+latest bounded AX state. A deterministic gate checks the current AX ref,
+editable capability, exact task literals, stalled actions, and blocked
+save/close/quit/delete/send operations before native execution. Every successor
+state is observed again, and completion requires evidence copied from the
+current AX outline.
+
+```sh
+npm run cua:hybrid -- \
+  --model openai-codex/gpt-5.5 \
+  --app TextEdit \
+  --bundle-id com.apple.TextEdit \
+  -- \
+  'TextEdit에서 Command-N으로 새 문서를 만든 다음 "hello"라고 입력하세요. 저장하거나 닫지 마세요.'
+```
+
+No local model server is required. `--app` and `--bundle-id` are optional when
+the task unambiguously names one installed application. Passing both skips the
+installed-application catalog scan. The JSON report separates GPT and native
+time and records each action, outcome, and completion evidence.
+
 The runtime prefers background semantics when they are credible, verifies the result, and escalates side-effect-free failed keyboard input to foreground delivery automatically. Ambiguous pointer actions are never replayed blindly.
 
 ### Successor views

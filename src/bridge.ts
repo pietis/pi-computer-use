@@ -8,7 +8,7 @@ import path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { canRetryInForeground, outcomeAfterCheck, outcomeAfterObservedValues, prepareAction, type ActionState, type PreparedAction } from "./actions.ts";
 import { cdpClickForContext, cdpDragForContext, cdpEvaluateForContext, cdpKeypressForContext, cdpMouseForContext, cdpNavigateContext, cdpScrollForContext, cdpSnapshotForContext, cdpTabForWindow, cdpTypeFocusedForContext, cdpTypeForContext, disconnectCdp, listCdpPageContexts, type CdpConsoleEntry, type CdpPageSnapshot } from "./cdp.ts";
-import { getComputerUseConfig, isBrowserUseEnabled, isHeadlessMode, loadComputerUseConfig } from "./config.ts";
+import { getComputerUseConfig, isBrowserUseEnabled, isHeadlessMode, loadComputerUseConfig, observationPolicy } from "./config.ts";
 import { noteAfterAct, noteFromLook, noteRegionKeyForRef, renderNote, type WindowNote } from "./note.ts";
 import { foldToBudget, graftScopedOutline, nodeByRef, outlineNodeLabel, outlineNodePath, rankedTextMatch, restoreOutline, searchOutline, searchOutlineRanked, serializeOutline, serializeOutlineNodeShallow, serializeOutlineSearchMatch, type LookResponse, type Outline, type OutlineChange, type OutlineNode, type OutlineSearchMatch, type SerializedOutline, type SerializedOutlineNode, type SerializedOutlineSearchMatch } from "./outline.ts";
 import { applyOutputEnvelope, boundToolError, clearStoredOutputs, OUTPUT_PAGE_BYTES, readStoredOutput, UI_TEXT_PAGE_CHARS } from "./output.ts";
@@ -18,6 +18,7 @@ import { currentPlatformBackend } from "./platform/index.ts";
 import type { FramePoints, HelperActPerformed, HelperActResult, NativeInputDelivery, PlatformActRequest, PlatformApp as HelperApp, PlatformDiagnostics, PlatformFrontmostResult as FrontmostResult, PlatformRoot as HelperWindow } from "./platform/types.ts";
 import type { PermissionStatus } from "./permissions.ts";
 import { ResourceScheduler } from "./runtime.ts";
+import { requestLightweightRecovery } from "./recovery.ts";
 import { SavedStates, type CurrentCapture, type CurrentTarget, type OperationState } from "./state.ts";
 import { changesBetween, renderChanges, stabilizeRefs } from "./view.ts";
 export type { ActParams, EvaluateBrowserParams, ExpandUiParams, ImageMode, InspectUiParams, LaunchBrowserParams, FindParams, MouseButtonName, NavigateBrowserParams, ObserveParams, ObserveTargetParams, ReadTextParams, RootSelector, SearchUiParams, StateTargetParams, UiAction, WaitForParams } from "./contract.ts";
@@ -57,6 +58,14 @@ interface ExecutionTrace {
 	escalatedToForeground?: boolean;
 	escalationReason?: string;
 	backgroundAttempt?: { outcome: "foreground_required" | "didnt"; reason: string };
+	timings?: {
+		totalMs: number;
+		deliveryMs: number;
+		verificationMs: number;
+		settleMs: number;
+		successorObservationMs: number;
+		resultBuildMs: number;
+	};
 	verification?: {
 		status: "verified" | "preexisting" | "failed";
 		text?: string;
@@ -106,6 +115,18 @@ interface ComputerUseDetails {
 		reason?: string;
 		message?: string;
 		debug?: unknown;
+	};
+	recovery?: {
+		handler: "lightweight";
+		thinking: "off";
+		status: "executed" | "escalated" | "failed";
+		model?: string;
+		confidence?: number;
+		reason?: string;
+		latencyMs: number;
+		primaryOutcome: ActOutcome;
+		recoveryOutcome?: ActOutcome;
+		error?: string;
 	};
 	/** Recent browser console messages/exceptions; only present when CDP is active. */
 	console?: CdpConsoleEntry[];
@@ -1674,21 +1695,20 @@ async function performObserve(params: ObserveParams, signal?: AbortSignal): Prom
 		return browserObservationResult(browser, resourceKey, scheduled.epoch, "observe_ui");
 	}
 	const state = operationState();
-	const mode = params.mode ?? "fused";
-	const image = mode === "semantic" ? "never" : mode === "visual" ? "always" : "auto";
-	const defaultReadText = mode === "semantic" ? "never" : mode === "visual" ? "always" : "auto";
-	const readText = params.readText ?? defaultReadText;
-	state.currentImageMode = normalizeImageMode(image);
+	const mode = params.mode ?? getComputerUseConfig().observation_mode;
+	const policy = observationPolicy(mode);
+	const readText = params.readText ?? policy.readText;
+	state.currentImageMode = normalizeImageMode(policy.imageMode);
 	const selection: ObserveTargetParams = { root: normalizeWindowSelector(params.root) };
 	const requestedTarget = selection.root
 		? await resolveTargetByWindowSelector(params.root!, signal)
 		: await resolveTargetForObserve(signal);
-	const imageMode = normalizeImageMode(image);
+	const imageMode = normalizeImageMode(policy.imageMode);
 	const resourceKey = desktopResourceKey(requestedTarget);
 	const scheduled = await resourceScheduler.read(resourceKey, async (epoch) => {
 		state.resourceKey = resourceKey;
 		state.epoch = epoch;
-		return await captureCurrentTarget(signal, readText, imageMode === "always" ? EXPLICIT_IMAGE_MAX_DIMENSION : AUTO_IMAGE_MAX_DIMENSION, requestedTarget, imageMode !== "never");
+		return await captureCurrentTarget(signal, readText, imageMode === "always" ? EXPLICIT_IMAGE_MAX_DIMENSION : AUTO_IMAGE_MAX_DIMENSION, requestedTarget, policy.includeImage);
 	});
 	const captureResult = scheduled.value;
 	// Model @r refs are re-minted on re-resolution, so ref string equality
@@ -1891,8 +1911,10 @@ function aggregateExecutions(steps: ExecutionTrace[]): ExecutionTrace {
 }
 
 async function performDesktopTransaction(params: ActParams, actions: UiAction[], signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails>> {
+	const transactionStartedAt = performance.now();
 	const state = operationState();
-	state.currentImageMode = "auto";
+	const successorPolicy = observationPolicy();
+	state.currentImageMode = successorPolicy.imageMode;
 	validateStateId(params.stateId);
 	const look = currentLookOrThrow();
 	const baseView = { stateId: state.currentCapture!.stateId, outline: state.currentOutline! };
@@ -1902,9 +1924,14 @@ async function performDesktopTransaction(params: ActParams, actions: UiAction[],
 	const noteBefore = state.currentNote;
 	return await withWindowWriteLock(target, async () => {
 		const headless = getComputerUseConfig().headless;
+		const deliveryStartedAt = performance.now();
 		const execution = await dispatchUiTransaction(actions, target, look, headless, signal);
+		const deliveryMs = performance.now() - deliveryStartedAt;
 		const executedActions = actions.slice(0, execution.actionCount ?? actions.length);
+		let verificationMs = 0;
+		let settleMs = 0;
 		if (condition) {
+			const verificationStartedAt = performance.now();
 			const { text: expectedText, role: expectedRole, value: expectedValue, scopeRef, scopeExact, gone, timeoutMs } = condition;
 			const beforePresent = outlineConditionPresent(look.parsedOutline!, condition);
 			const desiredWasPreexisting = beforePresent !== gone;
@@ -1934,15 +1961,81 @@ async function performDesktopTransaction(params: ActParams, actions: UiAction[],
 					message: `The action was delivered but its postcondition was not satisfied within ${timeoutMs}ms.`,
 				};
 			}
+			verificationMs = performance.now() - verificationStartedAt;
 		} else {
+			const settleStartedAt = performance.now();
 			await sleep(settleMsForExecution(execution), signal);
+			settleMs = performance.now() - settleStartedAt;
 		}
-		const capture = await captureCurrentTarget(signal, "auto", AUTO_IMAGE_MAX_DIMENSION, target);
+		const successorObservationStartedAt = performance.now();
+		const capture = await captureCurrentTarget(
+			signal,
+			successorPolicy.readText,
+			successorPolicy.imageMode === "always" ? EXPLICIT_IMAGE_MAX_DIMENSION : AUTO_IMAGE_MAX_DIMENSION,
+			target,
+			successorPolicy.includeImage,
+		);
+		const successorObservationMs = performance.now() - successorObservationStartedAt;
 		execution.outcome = outcomeAfterObservedValues(execution.outcome ?? "unknown", executedActions, (ref) => nodeByRef(capture.outline, ref)?.value);
 		for (const action of executedActions) {
 			state.currentNote = noteAfterAct(state.currentNote ?? noteBefore, action.ref, capture.outline, { window: noteWindowForTarget(capture.target, capture.look), rootDelta: execution.rootDelta });
 		}
-		return await buildToolResult("act_ui", `Executed ${executedActions.length} checked UI action${executedActions.length === 1 ? "" : "s"} in ${target.appName} — ${target.windowTitle}. Returned state ${capture.capture.stateId}.`, capture, execution, signal, state.currentImageMode, baseView);
+		const resultBuildStartedAt = performance.now();
+		const result = await buildToolResult("act_ui", `Executed ${executedActions.length} checked UI action${executedActions.length === 1 ? "" : "s"} in ${target.appName} — ${target.windowTitle}. Returned state ${capture.capture.stateId}.`, capture, execution, signal, state.currentImageMode, baseView);
+		const resultBuildMs = performance.now() - resultBuildStartedAt;
+		execution.timings = {
+			totalMs: performance.now() - transactionStartedAt,
+			deliveryMs,
+			verificationMs,
+			settleMs,
+			successorObservationMs,
+			resultBuildMs,
+		};
+		return result;
+	});
+}
+
+export interface TransitionActResult {
+	outcome: ActOutcome;
+	actionCount: number;
+	timings: {
+		totalMs: number;
+		deliveryMs: number;
+		settleMs: number;
+	};
+}
+
+/**
+ * Execute a phase that intentionally replaces the current root. Unlike act_ui,
+ * this does not try to capture the now-stale source root; the caller must
+ * acquire and observe the successor root immediately afterward.
+ */
+async function performTransitionAct(params: ActParams, signal?: AbortSignal): Promise<TransitionActResult> {
+	const startedAt = performance.now();
+	const actions = Array.isArray(params.actions) ? params.actions : [];
+	if (actions.length === 0) throw new Error("Transition phase requires at least one action.");
+	if (actions.length > 20) throw new Error("Transition phase supports at most 20 actions.");
+	for (const action of actions) validateActionTarget(action);
+	validateStateId(params.stateId);
+	const look = currentLookOrThrow();
+	const target = await ensureTargetWindowId(await resolveCurrentTarget(signal), signal);
+	return await withWindowWriteLock(target, async () => {
+		const deliveryStartedAt = performance.now();
+		const execution = await dispatchUiTransaction(actions, target, look, getComputerUseConfig().headless, signal);
+		const deliveryMs = performance.now() - deliveryStartedAt;
+		if (execution.outcome === "didnt") throw new Error("Transition action was not delivered.");
+		const settleStartedAt = performance.now();
+		await sleep(settleMsForExecution(execution), signal);
+		const settleMs = performance.now() - settleStartedAt;
+		return {
+			outcome: execution.outcome ?? "unknown",
+			actionCount: execution.actionCount ?? actions.length,
+			timings: {
+				totalMs: performance.now() - startedAt,
+				deliveryMs,
+				settleMs,
+			},
+		};
 	});
 }
 
@@ -2024,6 +2117,116 @@ async function performAct(params: ActParams, signal?: AbortSignal): Promise<Agen
 	for (const action of actions) validateActionTarget(action);
 	if (operationState().contextId) return await performBrowserTransaction(params, actions, signal);
 	return await performDesktopTransaction(params, actions, signal);
+}
+
+function isDesktopActResult(
+	result: AgentToolResult<ComputerUseDetails | BrowserObservationDetails>,
+): result is AgentToolResult<ComputerUseDetails> {
+	const details = result.details as Partial<ComputerUseDetails> | undefined;
+	return Boolean(details?.target && details.capture && details.execution);
+}
+
+function prependResultText<T>(result: AgentToolResult<T>, prefix: string): AgentToolResult<T> {
+	const content = [...result.content];
+	const firstText = content.findIndex((part) => part.type === "text");
+	if (firstText >= 0) {
+		const part = content[firstText];
+		if (part.type === "text") content[firstText] = { ...part, text: `${prefix}\n${part.text}` };
+	} else {
+		content.unshift({ type: "text", text: prefix });
+	}
+	return { ...result, content };
+}
+
+async function performActWithRecovery(
+	params: ActParams,
+	signal: AbortSignal | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<ComputerUseDetails | BrowserObservationDetails>> {
+	const primary = await performAct(params, signal);
+	const config = getComputerUseConfig();
+	if (!config.exception_handler || !isDesktopActResult(primary)) return primary;
+	const primaryOutcome = primary.details.execution.outcome ?? "unknown";
+	// An ambiguous delivery may already have caused a side effect. Never ask a
+	// hidden recovery call to replay or patch it automatically.
+	if (primaryOutcome !== "didnt") return primary;
+	const outline = operationState().currentOutline;
+	if (!outline) return primary;
+	const request = await requestLightweightRecovery(ctx, {
+		app: primary.details.target.app,
+		windowTitle: primary.details.target.windowTitle,
+		stateId: primary.details.capture.stateId,
+		outcome: primaryOutcome,
+		error: primary.details.execution.error,
+		verification: primary.details.execution.verification,
+		failedActions: params.actions,
+		outline: primary.details.renderedOutline ?? primary.content.filter((part) => part.type === "text").map((part) => part.text).join("\n"),
+		validRefs: new Set(outline.nodes.map((node) => node.ref)),
+	}, signal);
+	if (!request.decision || request.decision.decision === "escalate") {
+		const details: ComputerUseDetails = {
+			...primary.details,
+			recovery: {
+				handler: "lightweight",
+				thinking: "off",
+				status: request.error ? "failed" : "escalated",
+				model: request.model,
+				confidence: request.decision?.confidence,
+				reason: request.decision?.reason,
+				latencyMs: request.latencyMs,
+				primaryOutcome,
+				error: request.error,
+			},
+		};
+		const summary = request.error
+			? `Lightweight exception handler failed without executing recovery: ${request.error}`
+			: `Lightweight exception handler escalated without executing recovery: ${request.decision?.reason ?? "no safe recovery"}`;
+		return prependResultText({ ...primary, details }, summary);
+	}
+	try {
+		const recovery = await performAct({
+			stateId: primary.details.capture.stateId,
+			actions: request.decision.actions,
+			expect: request.decision.expect,
+		}, signal);
+		if (!isDesktopActResult(recovery)) return primary;
+		const recoveryOutcome = recovery.details.execution.outcome ?? "unknown";
+		const details: ComputerUseDetails = {
+			...recovery.details,
+			recovery: {
+				handler: "lightweight",
+				thinking: "off",
+				status: "executed",
+				model: request.model,
+				confidence: request.decision.confidence,
+				reason: request.decision.reason,
+				latencyMs: request.latencyMs,
+				primaryOutcome,
+				recoveryOutcome,
+			},
+		};
+		return prependResultText(
+			{ ...recovery, details },
+			`Lightweight exception handler executed ${request.decision.actions.length} guarded recovery action${request.decision.actions.length === 1 ? "" : "s"} with thinking off (${primaryOutcome} → ${recoveryOutcome}).`,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const details: ComputerUseDetails = {
+			...primary.details,
+			recovery: {
+				handler: "lightweight",
+				thinking: "off",
+				status: "failed",
+				model: request.model,
+				confidence: request.decision.confidence,
+				reason: request.decision.reason,
+				latencyMs: request.latencyMs,
+				primaryOutcome,
+				error: message,
+			},
+		};
+		return prependResultText({ ...primary, details }, `Lightweight exception handler produced a plan, but guarded recovery failed: ${message}`);
+	}
 }
 
 function managedBrowserExecutable(browser: "helium" | "chrome"): string {
@@ -2163,7 +2366,10 @@ async function executeTool<P, T>(ctx: ExtensionContext, params: P, signal: Abort
 	});
 }
 
-function makeToolExecutor<P, D>(tool: string, perform: (params: P, signal?: AbortSignal) => Promise<AgentToolResult<D>>) {
+function makeToolExecutor<P, D>(
+	tool: string,
+	perform: (params: P, signal: AbortSignal | undefined, ctx: ExtensionContext) => Promise<AgentToolResult<D>>,
+) {
 	return async (
 		_toolCallId: string,
 		params: P,
@@ -2172,7 +2378,7 @@ function makeToolExecutor<P, D>(tool: string, perform: (params: P, signal?: Abor
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<D>> => {
 		try {
-			return applyOutputEnvelope(tool, await executeTool(ctx, params, signal, () => perform(params, signal)));
+			return applyOutputEnvelope(tool, await executeTool(ctx, params, signal, () => perform(params, signal, ctx)));
 		} catch (error) {
 			throw boundToolError(tool, error);
 		}
@@ -2186,10 +2392,18 @@ export const executeObserve = makeToolExecutor("observe_ui", performObserve);
 export const executeSearchUi = makeToolExecutor("search_ui", performSearchUi);
 export const executeExpandUi = makeToolExecutor("expand_ui", performExpandUi);
 export const executeInspectUi = makeToolExecutor("inspect_ui", performInspectUi);
-export const executeAct = makeToolExecutor<ActParams, ComputerUseDetails | BrowserObservationDetails>("act_ui", performAct);
+export const executeAct = makeToolExecutor<ActParams, ComputerUseDetails | BrowserObservationDetails>("act_ui", performActWithRecovery);
 export const executeNavigateBrowser = makeToolExecutor("navigate_browser", performNavigateBrowser);
 export const executeEvaluateBrowser = makeToolExecutor("evaluate_browser", performEvaluateBrowser);
 export const executeLaunchBrowser = makeToolExecutor("launch_browser", performLaunchBrowser);
+
+export async function executeTransitionAct(
+	params: ActParams,
+	signal: AbortSignal | undefined,
+	ctx: ExtensionContext,
+): Promise<TransitionActResult> {
+	return await executeTool(ctx, params, signal, () => performTransitionAct(params, signal));
+}
 
 export function reconstructStateFromBranch(ctx: ExtensionContext): void {
 	savedStates.clear();

@@ -17,6 +17,9 @@ import {
 	shutdownComputerUseSession,
 } from "../src/bridge.ts";
 import { getLoadedComputerUseConfig, loadComputerUseConfig } from "../src/config.ts";
+import { formatFunctionGemmaCuaReport, runFunctionGemmaCuaTask } from "../src/functiongemma-cua.ts";
+import { formatHybridCuaReport, runHybridCuaTask } from "../src/hybrid-cua.ts";
+import { formatPlanOnceReport, parsePlanOnceCommandArgs, runPlanOnceTask } from "../src/plan-once.ts";
 
 const stateId = Type.String({ description: "Required state id owning every @e ref used by this operation" });
 const point = { x: Type.Number(), y: Type.Number() };
@@ -112,8 +115,11 @@ const actTool = defineTool({
 	name: "act_ui",
 	label: "Act",
 	description: "Perform one or more precisely targeted checked actions and return the successor state.",
-	promptSnippet: "Pass dependent click/type steps together and use expect for observable completion.",
-	promptGuidelines: ["After clicking an editable region, omit ref from typeText/keypress so input follows the established focus."],
+	promptSnippet: "Plan the predictable sequence once, pass dependent steps together, and use expect for observable completion.",
+	promptGuidelines: [
+		"Prefer one guarded batch over separate model turns for a predictable sequence.",
+		"After clicking an editable region, omit ref from typeText/keypress so input follows the established focus.",
+	],
 	parameters: Type.Object({ stateId, expect: Type.Optional(Type.Object(conditionProperties)), actions: Type.Array(uiAction, { minItems: 1, maxItems: 20 }) }),
 	execute: executeAct,
 });
@@ -170,6 +176,10 @@ function formatConfigStatus(): string {
 		"pi-computer-use configuration",
 		`browser_use: ${loaded.config.browser_use ? "enabled" : "disabled"}`,
 		`managed_browser: ${loaded.config.managed_browser}`,
+		`observation_mode: ${loaded.config.observation_mode}`,
+		`exception_handler: ${loaded.config.exception_handler ? "lightweight (thinking off)" : "disabled"}`,
+		`exception_handler_model: ${loaded.config.exception_handler_model ?? "current model"}`,
+		`exception_handler_confidence: ${loaded.config.exception_handler_confidence}`,
 		`headless: ${loaded.config.headless ? "enabled" : "disabled"}`,
 		`cursor_overlay: ${loaded.config.cursor_overlay ? "enabled" : "disabled"}`,
 		"",
@@ -187,6 +197,60 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			loadComputerUseConfig(ctx.cwd);
 			ctx.ui.notify(formatConfigStatus(), "info");
+		},
+	});
+
+	pi.registerCommand("computer-use-run", {
+		description: "Plan once, execute natively, and print a stage-by-stage latency report",
+		handler: async (args, ctx) => {
+			loadComputerUseConfig(ctx.cwd);
+			try {
+				const input = parsePlanOnceCommandArgs(args);
+				const report = await runPlanOnceTask(input, ctx);
+				const rendered = formatPlanOnceReport(report);
+				if (ctx.mode === "print" || ctx.mode === "json") console.log(rendered);
+				else ctx.ui.notify(rendered, report.ok ? "info" : "error");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (ctx.mode === "print" || ctx.mode === "json") console.error(message);
+				else ctx.ui.notify(message, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("computer-use-local", {
+		description: "Run the AX-native loop with the fine-tuned local FunctionGemma adapter",
+		handler: async (args, ctx) => {
+			loadComputerUseConfig(ctx.cwd);
+			try {
+				const input = parsePlanOnceCommandArgs(args);
+				const report = await runFunctionGemmaCuaTask(input, ctx);
+				const rendered = formatFunctionGemmaCuaReport(report);
+				if (ctx.mode === "print" || ctx.mode === "json") console.log(rendered);
+				else ctx.ui.notify(rendered, report.ok ? "info" : "error");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (ctx.mode === "print" || ctx.mode === "json") console.error(message);
+				else ctx.ui.notify(message, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("computer-use-hybrid", {
+		description: "Use a local action draft with deterministic validation and GPT fallback",
+		handler: async (args, ctx) => {
+			loadComputerUseConfig(ctx.cwd);
+			try {
+				const input = parsePlanOnceCommandArgs(args);
+				const report = await runHybridCuaTask(input, ctx);
+				const rendered = formatHybridCuaReport(report);
+				if (ctx.mode === "print" || ctx.mode === "json") console.log(rendered);
+				else ctx.ui.notify(rendered, report.ok ? "info" : "error");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (ctx.mode === "print" || ctx.mode === "json") console.error(message);
+				else ctx.ui.notify(message, "error");
+			}
 		},
 	});
 

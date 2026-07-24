@@ -10,6 +10,8 @@ docs/.source/
 # Local benchmark output
 benchmarks/results/*.local.*
 benchmarks/results/*local*
+.bench/
+/node
 tmp/
 
 # Rust build artifacts
