@@ -150,8 +150,11 @@ npm run cua:hybrid -- \
 
 No local model server is required. `--app` and `--bundle-id` are optional when
 the task unambiguously names one installed application. Passing both skips the
-installed-application catalog scan. The JSON report separates GPT and native
-time and records each action, outcome, and completion evidence.
+installed-application catalog scan. Root selection uses a zero-call fast path
+when discovery returns one candidate; when multiple roots remain, one bounded
+GPT call selects only among those current `@r` candidates. The JSON report
+separates root-selection, GPT-controller, and native time and records each
+action, outcome, and completion evidence.
 
 The runtime prefers background semantics when they are credible, verifies the result, and escalates side-effect-free failed keyboard input to foreground delivery automatically. Ambiguous pointer actions are never replayed blindly.
 

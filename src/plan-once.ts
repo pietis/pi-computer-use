@@ -58,10 +58,28 @@ export interface RootSnapshot {
 	framePoints?: { x: number; y: number; w: number; h: number };
 }
 
-interface RootTimings {
+export interface RootTimings {
 	rootAcquireMs: number;
+	rootSelectionMs: number;
+	rootSelectionMode: "single" | "deterministic" | "model";
+	rootCandidateCount: number;
 	observeMs: number;
 }
+
+export interface RootCandidate {
+	app: string;
+	bundleId?: string;
+	kind: string;
+	windowTitle: string;
+	windowRef: string;
+	isMain: boolean;
+	isFocused: boolean;
+	isModal: boolean;
+	isOnscreen: boolean;
+	isMinimized: boolean;
+}
+
+export type RootCandidateSelector = (candidates: RootCandidate[]) => Promise<string>;
 
 export interface ResolvedAppTarget {
 	app: string;
@@ -342,30 +360,66 @@ function resultText(result: { content: Array<{ type: string; text?: string }> })
 	return result.content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
 }
 
-export async function acquireRoot(app: string, bundleId: string | undefined, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ snapshot: RootSnapshot; timings: RootTimings }> {
+export async function acquireRoot(
+	app: string,
+	bundleId: string | undefined,
+	ctx: ExtensionContext,
+	signal?: AbortSignal,
+	selectRoot?: RootCandidateSelector,
+): Promise<{ snapshot: RootSnapshot; timings: RootTimings }> {
 	const acquireStartedAt = now();
 	let root: any;
+	let rootCandidateCount = 0;
+	let rootSelectionMs = 0;
+	let rootSelectionMode: RootTimings["rootSelectionMode"] = "deterministic";
 	let lastResult: Awaited<ReturnType<typeof executeFind>> | undefined;
 	const deadline = Date.now() + 6_000;
 	do {
 		lastResult = await executeFind("plan-once-find", bundleId ? { bundleId } : { app }, signal, undefined, ctx);
 		let windows = (lastResult.details as any)?.windows as any[] | undefined;
-		root = windows?.find((candidate) => candidate.isFocused)
-			?? windows?.find((candidate) => candidate.isMain)
-			?? windows?.[0];
+		const candidates = (windows ?? []).filter((candidate) => typeof candidate.windowRef === "string") as RootCandidate[];
+		rootCandidateCount = candidates.length;
+		if (candidates.length === 1) {
+			root = candidates[0];
+			rootSelectionMode = "single";
+		} else if (candidates.length > 1 && selectRoot) {
+			const selectionStartedAt = now();
+			const selectedRef = await selectRoot(candidates);
+			rootSelectionMs += now() - selectionStartedAt;
+			root = candidates.find((candidate) => candidate.windowRef === selectedRef);
+			if (!root) throw new Error(`Root selector returned unavailable ref '${selectedRef}'.`);
+			rootSelectionMode = "model";
+		} else {
+			root = candidates.find((candidate) => candidate.isFocused)
+				?? candidates.find((candidate) => candidate.isMain)
+				?? candidates[0];
+			rootSelectionMode = "deterministic";
+		}
 		if (!root?.windowRef) {
 			// macOS may localize appName (for example TextEdit) even though
 			// `open -a` accepts the unlocalized product name. The app was just
 			// activated, so a focused broad root is the safe identity fallback.
 			lastResult = await executeFind("plan-once-find-focused", {}, signal, undefined, ctx);
 			windows = (lastResult.details as any)?.windows as any[] | undefined;
-			root = windows?.find((candidate) => candidate.isFocused);
+			const candidates = (windows ?? []).filter((candidate) => typeof candidate.windowRef === "string") as RootCandidate[];
+			rootCandidateCount = candidates.length;
+			if (candidates.length > 1 && selectRoot) {
+				const selectionStartedAt = now();
+				const selectedRef = await selectRoot(candidates);
+				rootSelectionMs += now() - selectionStartedAt;
+				root = candidates.find((candidate) => candidate.windowRef === selectedRef);
+				if (!root) throw new Error(`Root selector returned unavailable ref '${selectedRef}'.`);
+				rootSelectionMode = "model";
+			} else {
+				root = candidates.find((candidate) => candidate.isFocused) ?? candidates[0];
+				rootSelectionMode = candidates.length === 1 ? "single" : "deterministic";
+			}
 		}
 		if (root?.windowRef) break;
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	} while (Date.now() < deadline);
 	if (!root?.windowRef) throw new Error(`No controllable root appeared for '${app}'. ${lastResult ? resultText(lastResult as any) : ""}`.trim());
-	const rootAcquireMs = now() - acquireStartedAt;
+	const rootAcquireMs = now() - acquireStartedAt - rootSelectionMs;
 	const observeStartedAt = now();
 	const observed = await executeObserve("plan-once-observe", { root: root.windowRef, mode: "semantic", readText: "never" }, signal, undefined, ctx);
 	const details = observed.details as any;
@@ -387,7 +441,13 @@ export async function acquireRoot(app: string, bundleId: string | undefined, ctx
 				}
 				: undefined,
 		},
-		timings: { rootAcquireMs, observeMs: now() - observeStartedAt },
+		timings: {
+			rootAcquireMs,
+			rootSelectionMs,
+			rootSelectionMode,
+			rootCandidateCount,
+			observeMs: now() - observeStartedAt,
+		},
 	};
 }
 

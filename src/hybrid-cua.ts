@@ -11,6 +11,7 @@ import {
 	acquireRoot,
 	launchApp,
 	resolveAppTarget,
+	type RootCandidate,
 	type ResolvedAppTarget,
 	type RootSnapshot,
 } from "./plan-once.ts";
@@ -57,6 +58,10 @@ export interface HybridCuaReport {
 		setupMs: number;
 		launchMs: number;
 		rootAcquireMs: number;
+		rootSelectionMode: "single" | "deterministic" | "model";
+		rootCandidateCount: number;
+		rootSelectionGptCalls: number;
+		rootSelectionGptMs: number;
 		initialObservationMs: number;
 		gptCalls: number;
 		gptTotalMs: number;
@@ -85,6 +90,17 @@ Rules:
 - Never repeat an action listed in blockedActions; it already produced no semantic state change.
 - Choose done only when the entire task is complete, not merely one sub-step, and exact current-outline evidence proves the resulting state.
 - Report honest confidence; deterministic ref, content, and risk checks independently gate every action.`;
+
+const ROOT_SELECTION_SYSTEM_PROMPT = `You select exactly one current macOS accessibility root.
+Return exactly one compact JSON object and no markdown:
+{"rootRef":"@rN","reason":"short"}
+
+Rules:
+- Use only a rootRef from candidates.
+- Select the root that best matches the complete task and target app.
+- Prefer a blocking modal root when it belongs to the target app.
+- When candidates are semantically interchangeable, prefer focused, then main, then onscreen.
+- Never select another app unless the task explicitly requires it.`;
 
 function now(): number {
 	return performance.now();
@@ -133,6 +149,61 @@ function jsonObject(text: string): Record<string, unknown> | undefined {
 			return undefined;
 		}
 	}
+}
+
+async function requestGptRootSelection(
+	ctx: ExtensionCommandContext,
+	task: string,
+	target: ResolvedAppTarget,
+	candidates: RootCandidate[],
+): Promise<{ rootRef: string; latencyMs: number }> {
+	const startedAt = now();
+	if (!ctx.model) throw new Error("No GPT root-selection model is selected.");
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+	if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? `No API key for ${ctx.model.provider}.` : auth.error);
+	const response = await completeSimple(
+		ctx.model,
+		{
+			systemPrompt: ROOT_SELECTION_SYSTEM_PROMPT,
+			messages: [{
+				role: "user",
+				content: JSON.stringify({
+					task,
+					targetApp: target,
+					candidates: candidates.map((candidate) => ({
+						rootRef: candidate.windowRef,
+						app: candidate.app,
+						bundleId: candidate.bundleId,
+						kind: candidate.kind,
+						title: candidate.windowTitle,
+						focused: candidate.isFocused,
+						main: candidate.isMain,
+						modal: candidate.isModal,
+						onscreen: candidate.isOnscreen,
+						minimized: candidate.isMinimized,
+					})),
+				}),
+				timestamp: Date.now(),
+			}],
+		},
+		{
+			apiKey: auth.apiKey,
+			headers: auth.headers,
+			maxTokens: 160,
+			maxRetries: 0,
+			timeoutMs: 15_000,
+			signal: ctx.signal,
+		},
+	);
+	if (response.stopReason === "error" || response.stopReason === "aborted") {
+		throw new Error(response.errorMessage ?? `GPT root selection stopped with ${response.stopReason}.`);
+	}
+	const raw = jsonObject(textFromResponse(response));
+	const rootRef = typeof raw?.rootRef === "string" ? raw.rootRef : "";
+	if (!candidates.some((candidate) => candidate.windowRef === rootRef)) {
+		throw new Error(`GPT root selection returned unavailable ref '${rootRef || "(empty)"}'.`);
+	}
+	return { rootRef, latencyMs: now() - startedAt };
 }
 
 function outlineLine(snapshot: RootSnapshot, ref: string | undefined): string | undefined {
@@ -375,6 +446,10 @@ export async function runHybridCuaTask(
 	let setupMs = 0;
 	let launchMs = 0;
 	let rootAcquireMs = 0;
+	let rootSelectionMode: "single" | "deterministic" | "model" = "deterministic";
+	let rootCandidateCount = 0;
+	let rootSelectionGptCalls = 0;
+	let rootSelectionGptMs = 0;
 	let initialObservationMs = 0;
 	let nativeTotalMs = 0;
 	try {
@@ -390,9 +465,26 @@ export async function runHybridCuaTask(
 		await launchApp(target.app, target.bundleId, target.appPath, ctx.signal);
 		launchMs = now() - launchStartedAt;
 
-		const acquired = await acquireRoot(target.app, target.bundleId, ctx, ctx.signal);
+		const acquired = await acquireRoot(
+			target.app,
+			target.bundleId,
+			ctx,
+			ctx.signal,
+			async (candidates) => {
+				rootSelectionGptCalls += 1;
+				const selectionStartedAt = now();
+				try {
+					const selected = await requestGptRootSelection(ctx, input.task, target, candidates);
+					return selected.rootRef;
+				} finally {
+					rootSelectionGptMs += now() - selectionStartedAt;
+				}
+			},
+		);
 		snapshot = acquired.snapshot;
 		rootAcquireMs = acquired.timings.rootAcquireMs;
+		rootSelectionMode = acquired.timings.rootSelectionMode;
+		rootCandidateCount = acquired.timings.rootCandidateCount;
 		initialObservationMs = acquired.timings.observeMs;
 		for (let index = 0; index < MAX_ROUNDS; index += 1) {
 			const gpt = await requestGptDecision(
@@ -415,9 +507,13 @@ export async function runHybridCuaTask(
 					totalStartedAt,
 					targetResolutionMs,
 					setupMs,
-					launchMs,
-					rootAcquireMs,
-					initialObservationMs,
+						launchMs,
+						rootAcquireMs,
+						rootSelectionMode,
+						rootCandidateCount,
+						rootSelectionGptCalls,
+						rootSelectionGptMs,
+						initialObservationMs,
 					nativeTotalMs,
 					gptModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)",
 					completionEvidence: gpt.doneEvidence,
@@ -460,9 +556,13 @@ export async function runHybridCuaTask(
 			totalStartedAt,
 			targetResolutionMs,
 			setupMs,
-			launchMs,
-			rootAcquireMs,
-			initialObservationMs,
+				launchMs,
+				rootAcquireMs,
+				rootSelectionMode,
+				rootCandidateCount,
+				rootSelectionGptCalls,
+				rootSelectionGptMs,
+				initialObservationMs,
 			nativeTotalMs,
 			gptModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)",
 			error: error instanceof Error ? error.message : String(error),
@@ -482,6 +582,10 @@ function buildReport(
 		setupMs: number;
 		launchMs: number;
 		rootAcquireMs: number;
+		rootSelectionMode: "single" | "deterministic" | "model";
+		rootCandidateCount: number;
+		rootSelectionGptCalls: number;
+		rootSelectionGptMs: number;
 		initialObservationMs: number;
 		nativeTotalMs: number;
 		gptModel: string;
@@ -489,7 +593,8 @@ function buildReport(
 		error?: string;
 	},
 ): HybridCuaReport {
-	const gptTotalMs = rounds.reduce((sum, round) => sum + round.gptMs, 0);
+	const controllerGptMs = rounds.reduce((sum, round) => sum + round.gptMs, 0);
+	const gptTotalMs = controllerGptMs + values.rootSelectionGptMs;
 	return {
 		ok,
 		app: target.app,
@@ -506,8 +611,12 @@ function buildReport(
 			setupMs: roundMs(values.setupMs),
 			launchMs: roundMs(values.launchMs),
 			rootAcquireMs: roundMs(values.rootAcquireMs),
+			rootSelectionMode: values.rootSelectionMode,
+			rootCandidateCount: values.rootCandidateCount,
+			rootSelectionGptCalls: values.rootSelectionGptCalls,
+			rootSelectionGptMs: roundMs(values.rootSelectionGptMs),
 			initialObservationMs: roundMs(values.initialObservationMs),
-			gptCalls: rounds.length,
+			gptCalls: rounds.length + values.rootSelectionGptCalls,
 			gptTotalMs: roundMs(gptTotalMs),
 			nativeTotalMs: roundMs(values.nativeTotalMs),
 			rounds,
