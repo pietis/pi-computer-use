@@ -465,21 +465,22 @@ export async function runHybridCuaTask(
 		await launchApp(target.app, target.bundleId, target.appPath, ctx.signal);
 		launchMs = now() - launchStartedAt;
 
+		const selectRootCandidate = async (candidates: RootCandidate[]): Promise<string> => {
+			rootSelectionGptCalls += 1;
+			const selectionStartedAt = now();
+			try {
+				const selected = await requestGptRootSelection(ctx, input.task, target, candidates);
+				return selected.rootRef;
+			} finally {
+				rootSelectionGptMs += now() - selectionStartedAt;
+			}
+		};
 		const acquired = await acquireRoot(
 			target.app,
 			target.bundleId,
 			ctx,
 			ctx.signal,
-			async (candidates) => {
-				rootSelectionGptCalls += 1;
-				const selectionStartedAt = now();
-				try {
-					const selected = await requestGptRootSelection(ctx, input.task, target, candidates);
-					return selected.rootRef;
-				} finally {
-					rootSelectionGptMs += now() - selectionStartedAt;
-				}
-			},
+			selectRootCandidate,
 		);
 		snapshot = acquired.snapshot;
 		rootAcquireMs = acquired.timings.rootAcquireMs;
@@ -528,7 +529,7 @@ export async function runHybridCuaTask(
 				const transitioned = await executeTransitionAct({ stateId: snapshot.stateId, actions: [decision.action] } satisfies ActParams, ctx.signal, ctx);
 				round.outcome = transitioned.outcome;
 				if (transitioned.outcome === "didnt") throw new Error(`Round ${index + 1} transition action failed.`);
-				snapshot = (await acquireRoot(target.app, target.bundleId, ctx, ctx.signal)).snapshot;
+				snapshot = (await acquireRoot(target.app, target.bundleId, ctx, ctx.signal, selectRootCandidate)).snapshot;
 			} else {
 				const result = await executeAct(
 					`hybrid-act-${index + 1}`,
